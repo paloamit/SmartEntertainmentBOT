@@ -1,0 +1,116 @@
+# ============================================================ Render blueprint
+# Lives at the REPOSITORY ROOT so Render auto-detects it as a Blueprint.
+# The app lives one level down in EntertainmentBOT/, so every rootDir here
+# is relative to the repo root, not to this file.
+#
+# SECURITY: every secret below uses `sync: false`, which tells Render to
+# PROMPT you for the value in the dashboard. No key is ever written into
+# this file or committed to the repo.
+
+services:
+  # ---------------------------------------------------------------- API ----
+  - type: web
+    name: entertainmentbot-api
+    runtime: python
+    rootDir: EntertainmentBOT/backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    autoDeployTrigger: commit
+    envVars:
+      # ---- models (not secret) ----
+      - key: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: LLM_MODEL_LARGE
+        value: openai/gpt-oss-120b
+      - key: LLM_MODEL_SMALL
+        value: openai/gpt-oss-20b
+      # Must stay EMPTY. Sending any value makes gpt-oss emit no tool calls
+      # at all, which silently breaks every turn. See app/llm.py::_extra().
+      - key: LLM_REASONING_EFFORT
+        value: ""
+      - key: LLM_FAILOVER_ENABLED
+        value: "true"
+      - key: LLM_FAILOVER_MODELS
+        value: openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b
+
+      # ---- vision (Gemini via OpenAI-compatible endpoint) ----
+      - key: LLM_VISION_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai
+      - key: LLM_VISION_MODEL
+        value: gemini-3.5-flash
+
+      # ---- SECRETS: you will be prompted for each of these ----
+      - key: LLM_API_KEY
+        sync: false          # Groq
+      - key: LLM_VISION_API_KEY
+        sync: false          # Google Gemini (vision)
+      - key: WATCHMODE_API_KEY
+        sync: false          # catalog + "where to watch"
+      - key: OMDB_API_KEY
+        sync: false          # IMDb ratings
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      # Optional — leave blank. Required only if you want real discovery
+      # filters, "more like this", trailers and cast instead of the
+      # Watchmode/AniList fallbacks.
+      - key: TMDB_API_KEY
+        sync: false
+      # Optional shared cache. Blank uses the in-process cache (24h TTL).
+      - key: REDIS_URL
+        sync: false
+      # Optional persistent DB. Blank uses SQLite, which Render WIPES on
+      # every restart — chats will vanish. Recommended for free tier:
+      # a free Render Postgres instance, or Neon.
+      - key: DATABASE_URL
+        sync: false
+
+      # ---- catalog sources ----
+      - key: ENABLE_ANILIST_FALLBACK
+        value: "true"
+      - key: ENABLE_JIKAN_FALLBACK
+        value: "true"
+      - key: ENABLE_TVMAZE_FALLBACK
+        value: "true"
+
+      # ---- observability ----
+      - key: LANGFUSE_HOST
+        value: https://cloud.langfuse.com
+      - key: LANGFUSE_ENVIRONMENT
+        value: production
+      - key: ENABLE_METRICS
+        value: "true"
+
+      # ---- limits / cache ----
+      - key: MAX_SESSIONS
+        value: "5"
+      - key: MAX_QUERIES_PER_SESSION
+        value: "10"
+      - key: MAX_RECOMMENDATIONS
+        value: "5"
+      - key: CACHE_TTL_SECONDS
+        value: "86400"
+      # Set this AFTER the first deploy to the web service's URL, e.g.
+      # https://entertainmentbot-web.onrender.com
+      - key: CORS_ORIGINS
+        value: "*"
+
+  # ---------------------------------------------------------------- WEB ----
+  - type: web
+    name: entertainmentbot-web
+    runtime: static
+    rootDir: EntertainmentBOT/frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    autoDeployTrigger: commit
+    envVars:
+      # Baked in at BUILD time, so it must be set before the first build.
+      # Use https://entertainmentbot-api.onrender.com
+      - key: VITE_API_BASE_URL
+        sync: false
+      # Tell the SPA router to hand every path to index.html.
+      - key: REACT_APP_rewrite
+        value: "/* /index.html 200"

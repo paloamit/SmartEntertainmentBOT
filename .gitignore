@@ -1,0 +1,52 @@
+# ============================================================== SECRETS
+# Nothing in this block may ever be committed. Every real value lives in
+# Render's dashboard (Environment tab) or in a local .env that stays here.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets/
+*.jks
+credentials*.json
+service-account*.json
+
+# --------------------------------------------------------------- Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# --------------------------------------------------------------- Node
+node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+.vite/
+.cache/
+
+# --------------------------------------------------------------- Runtime
+*.db
+*.sqlite
+*.sqlite3
+backend/data/
+backend/instance/
+uploads/
+*.log
+
+# --------------------------------------------------------------- Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
