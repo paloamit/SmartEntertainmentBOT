@@ -1,0 +1,10 @@
+# Local development only — NOT installed on Render.
+#
+# nodemon is a Node.js package used for live reload while editing. It was
+# previously in requirements.txt, which made `pip install` fail outright
+# ("No matching distribution found for nodemon") and broke every deploy.
+# Install it alongside nodemon instead:
+#
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+-r requirements.txt

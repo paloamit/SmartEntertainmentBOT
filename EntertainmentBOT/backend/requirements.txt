@@ -1,6 +1,7 @@
+# Production dependencies. Everything here must pip-install cleanly — the
+# Render build runs `pip install -r requirements.txt` in a clean environment.
 fastapi>=0.111
 uvicorn[standard]>=0.30
-nodemon>=3.1
 openai>=1.40
 httpx>=0.27
 pydantic>=2.7
@@ -9,5 +10,7 @@ SQLAlchemy>=2.0
 psycopg[binary]>=3.1
 redis>=5.0
 python-multipart>=0.0.9
+# Must stay on 5.x — app/observability.py imports propagate_attributes and
+# LangfuseMedia, which the 2.x line does not provide.
 langfuse>=5,<6
 prometheus-fastapi-instrumentator>=7.0
