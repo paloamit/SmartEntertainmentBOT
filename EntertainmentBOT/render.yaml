@@ -1,0 +1,73 @@
+services:
+  # ---------------------------------------------------------------- API ----
+  - type: web
+    name: entertainmentbot-api
+    runtime: python
+    rootDir: backend
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: LLM_MODEL_LARGE
+        value: openai/gpt-oss-120b
+      - key: LLM_MODEL_SMALL
+        value: openai/gpt-oss-20b
+      - key: LLM_REASONING_EFFORT
+        value: low
+
+      - key: TMDB_API_KEY
+        sync: false
+      - key: OMDB_API_KEY
+        sync: false
+      - key: ENABLE_JIKAN_FALLBACK
+        value: "true"
+      - key: ENABLE_TVMAZE_FALLBACK
+        value: "true"
+
+      # Optional: shared cache across instances. Leave unset to use the
+      # built-in in-process cache (same 24h TTL).
+      - key: REDIS_URL
+        sync: false
+
+      # Required for persistent sessions on the free tier — Render wipes local
+      # disk on every restart. Use a free Render Postgres or Neon database.
+      - key: DATABASE_URL
+        sync: false
+
+      - key: MAX_SESSIONS
+        value: "5"
+      - key: MAX_QUERIES_PER_SESSION
+        value: "10"
+      - key: MAX_RECOMMENDATIONS
+        value: "5"
+      - key: CACHE_TTL_SECONDS
+        value: "86400"
+      - key: CORS_ORIGINS
+        value: "*"
+
+      - key: LANGFUSE_PUBLIC_KEY
+        sync: false
+      - key: LANGFUSE_SECRET_KEY
+        sync: false
+      - key: LANGFUSE_HOST
+        value: https://cloud.langfuse.com
+      - key: LANGFUSE_ENVIRONMENT
+        value: production
+      - key: ENABLE_METRICS
+        value: "true"
+
+  # ---------------------------------------------------------------- WEB ----
+  - type: web
+    name: entertainmentbot-web
+    runtime: static
+    rootDir: frontend
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    envVars:
+      - key: VITE_API_BASE_URL
+        sync: false

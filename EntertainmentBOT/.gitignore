@@ -1,0 +1,21 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+
+# Database (SQLite is local-only; production uses DATABASE_URL)
+backend/*.db
+backend/*.db-wal
+backend/*.db-shm
+
+# Env / secrets — never commit real keys
+.env
+backend/.env
+frontend/.env
+
+# Node / build
+frontend/node_modules/
+frontend/dist/
+
+# OS
+.DS_Store
