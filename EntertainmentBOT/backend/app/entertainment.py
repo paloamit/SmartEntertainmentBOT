@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date
 from typing import Any, Optional
@@ -516,6 +517,23 @@ def _jikan_staff(a: dict) -> list[str]:
     return []
 
 
+def _tvmaze_genres(genres) -> list[str]:
+    """Normalise TVMaze genres, which arrive in two different shapes.
+
+    ``/shows/{id}`` returns objects (``{"id": 1, "name": "Drama"}``) while
+    ``/search/shows`` returns bare strings (``"Drama"``). The card builder
+    assumed the first shape, so every TVMaze search died on
+    ``'str' object has no attribute 'get'`` and silently degraded to whatever
+    weaker source was left.
+    """
+    out: list[str] = []
+    for g in genres or []:
+        name = g.get("name") if isinstance(g, dict) else g
+        if isinstance(name, str) and name.strip():
+            out.append(name.strip())
+    return out
+
+
 def _tvmaze_cards(items: list[dict], limit: int = 6) -> list[dict]:
     out = []
     for w in items[:limit]:
@@ -535,7 +553,7 @@ def _tvmaze_cards(items: list[dict], limit: int = 6) -> list[dict]:
             "poster_url": show.get("image", {}).get("original") or "",
             "backdrop_url": show.get("image", {}).get("original") or "",
             "year": year, "release_date": show.get("premiered") or "",
-            "genres": [g.get("name") for g in (show.get("genres") or []) if g.get("name")],
+            "genres": _tvmaze_genres(show.get("genres")),
             "countries": [country_label(show.get("country", {}).get("code"))],
             "country_codes": [show.get("country", {}).get("code") or ""],
             "original_language": "en", "language": "English",
@@ -1175,6 +1193,44 @@ _wm_regions: set[str] | None = None
 
 def watchmode_configured() -> bool:
     return bool(_settings.watchmode_api_key.strip())
+
+
+def probe_sources() -> dict[str, dict]:
+    """Live reachability check for every catalog source.
+
+    "Configured" only proves a key is present. This proves the provider
+    actually answers from *this* machine, which is how we tell a bad key or a
+    rate limit apart from a genuine miss — a distinction that is invisible
+    from the chat UI and was the reason a dead Watchmode key made the bot
+    claim real films did not exist.
+    """
+    out: dict[str, dict] = {}
+
+    def timed(name: str, fn) -> None:
+        started = time.monotonic()
+        try:
+            count = fn()
+            out[name] = {
+                "ok": True,
+                "results": count,
+                "ms": round((time.monotonic() - started) * 1000),
+            }
+        except Exception as exc:  # a probe must never raise
+            out[name] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"[:160]}
+
+    if watchmode_configured():
+        timed("watchmode", lambda: len(_watchmode_search("Shawshank", "movie", 3)))
+    if _settings.omdb_api_key.strip():
+        timed("omdb", lambda: len(_omdb_search("Shawshank", "movie", 3)))
+    if _settings.enable_anilist_fallback:
+        timed("anilist", lambda: len(_anilist_search("Cowboy Bebop", 3)))
+    if _settings.enable_jikan_fallback:
+        timed("jikan", lambda: len(_jikan_cards(
+            _jikan("/anime", {"q": "cowboy bebop", "limit": 3}) or [], 3)))
+    if _settings.enable_tvmaze_fallback:
+        timed("tvmaze", lambda: len(_tvmaze_cards(
+            _tvmaze("/search/shows", {"q": "dark"}) or [], 3)))
+    return out
 
 
 def _watchmode(path: str, params: dict | None = None,

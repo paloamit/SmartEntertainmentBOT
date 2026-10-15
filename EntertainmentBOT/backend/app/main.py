@@ -153,6 +153,24 @@ async def _unhandled(request: Request, exc: Exception):
     return JSONResponse(status_code=500, content={"detail": "internal server error"})
 
 
+@app.get("/api/diagnostics")
+def diagnostics():
+    """Live per-source reachability. Cheap enough to call on demand.
+
+    Separate from /api/health because it makes outbound network calls and can
+    take a few seconds on a cold free-tier instance.
+    """
+    return {
+        "configured": {
+            "llm": llm.has_key(),
+            "vision": llm.vision_available(),
+            "watchmode": entertainment.watchmode_configured(),
+            "omdb": bool(settings.omdb_api_key.strip()),
+        },
+        "live": entertainment.probe_sources(),
+    }
+
+
 # ================================================================ bootstrap
 @app.get("/api/health")
 def health():
@@ -162,6 +180,17 @@ def health():
                    "vision": settings.llm_vision_model},
         "llm_configured": llm.has_key(),
         "tmdb_configured": entertainment.tmdb_configured(),
+        # Which catalog sources actually hold a credential. This used to be
+        # invisible, so a missing WATCHMODE_API_KEY looked identical to
+        # "the search found nothing" from the outside — the bot just said it
+        # could not find a title that was sitting in the database.
+        "sources": {
+            "watchmode": entertainment.watchmode_configured(),
+            "omdb": bool(settings.omdb_api_key.strip()),
+            "anilist": settings.enable_anilist_fallback,
+            "jikan": settings.enable_jikan_fallback,
+            "tvmaze": settings.enable_tvmaze_fallback,
+        },
         "fallback_sources": [
             name for name, on in (
                 ("jikan", settings.enable_jikan_fallback),
