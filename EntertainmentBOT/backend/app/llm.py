@@ -534,6 +534,69 @@ _BAD_GENERATION_HINTS = ("failed to parse tool call arguments",
                          "failed to validate json")
 
 
+# Longest we will sit on a provider's back and wait rather than fail. Above
+# this the user is better served by an immediate, honest error.
+_MAX_RATE_LIMIT_WAIT = 45.0
+
+
+def _rate_limit_wait(exc: BaseException) -> float | None:
+    """Seconds the provider asked us to wait, if it is short enough to sit out.
+
+    Groq rate-limits per *organisation*, not per model, so failing over to a
+    sibling model does not help: the whole chain 429s in the same breath and
+    the turn dies with "every model in the chain failed". The provider tells us
+    when the window reopens — `retry-after`, or Groq's own
+    `x-ratelimit-reset-*` values, which arrive as "58.774s" — so waiting that
+    out turns a hard failure into a slower success.
+
+    Returns None for day/month quotas, which will not clear in a user turn.
+    """
+    resp = getattr(exc, "response", None)
+    if resp is None:
+        return None
+
+    body = ""
+    try:
+        body = (resp.text or "").lower()
+    except Exception:
+        body = ""
+
+    # A daily/monthly budget will not refill mid-conversation; do not hang.
+    for marker in ("tokens per day", "tpd", "requests per day", "rpd"):
+        if marker in body:
+            return None
+
+    headers = {}
+    try:
+        headers = {k.lower(): v for k, v in resp.headers.items()}
+    except Exception:
+        headers = {}
+
+    candidates = [
+        headers.get("retry-after"),
+        headers.get("x-ratelimit-reset-tokens"),
+        headers.get("x-ratelimit-reset-requests"),
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        text = str(raw).strip().lower()
+        try:
+            # Order matters: "1500ms" also ends with "s", so milliseconds has
+            # to be tested first or it parses as 1500 *minutes*-of-seconds.
+            if text.endswith("ms"):
+                seconds = float(text[:-2]) / 1000.0
+            elif text.endswith("s"):
+                seconds = float(text[:-1])
+            else:
+                seconds = float(text)
+        except ValueError:
+            continue
+        if 0 < seconds <= _MAX_RATE_LIMIT_WAIT:
+            return seconds
+    return None
+
+
 def _is_failover_error(exc: BaseException) -> bool:
     """True when another model would plausibly succeed where this one failed."""
     if type(exc).__name__ in _FAILOVER_NAMES:
@@ -565,25 +628,35 @@ def _complete_with_failover(messages: list[dict], tools: list[dict],
     for name in chain:
         if name in tried:
             continue
-        try:
-            resp = _client_instance().chat.completions.create(
-                model=name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.55,
-                **_extra(),
-            )
-            return resp, name, tried
-        except Exception as exc:
-            tried.append(name)
-            last_exc = exc
-            if not _is_failover_error(exc):
-                raise
-            nxt = next((c for c in chain if c not in tried), None)
-            if not nxt:
-                raise
-            _note_failover(name, nxt, task, exc)
+        waited_for = 0.0
+        while True:
+            try:
+                resp = _client_instance().chat.completions.create(
+                    model=name,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.55,
+                    **_extra(),
+                )
+                return resp, name, tried
+            except Exception as exc:
+                wait = _rate_limit_wait(exc)
+                if wait and waited_for + wait <= _MAX_RATE_LIMIT_WAIT:
+                    waited_for += wait
+                    logger.info("rate limited on %s; waiting %.1fs (retry %d)",
+                                name, wait, int(waited_for / 5) + 1)
+                    metrics.llm_error("rate_limit_wait")
+                    time.sleep(wait)
+                    continue
+                tried.append(name)
+                last_exc = exc
+                if not _is_failover_error(exc):
+                    raise
+                nxt = next((c for c in chain if c not in tried), None)
+                if not nxt:
+                    raise
+                _note_failover(name, nxt, task, exc)
     if last_exc:
         raise last_exc
     raise RuntimeError("no model available for this request")
@@ -597,35 +670,49 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
     for name in chain:
         if name in tried:
             continue
-        try:
-            stream = _client_instance().chat.completions.create(
-                model=name,
-                messages=messages,
-                tools=tools,
-                tool_choice="auto",
-                temperature=0.55,
-                stream=True,
-                stream_options={"include_usage": True},
-                **_extra(),
-            )
-            # Probe the stream so a lazy 429/503 is raised here rather than
-            # halfway through the user's reply. The chunk is re-yielded to the
-            # caller, so nothing is lost.
-            stream_it = iter(stream)
+        # Rate limits are per organisation, so give the provider's own
+        # retry window a chance before spending the rest of the chain.
+        waited_for = 0.0
+        while True:
             try:
-                peek = next(stream_it)
-            except StopIteration:
-                peek = None
-            return _ReplayedStream(stream_it, peek), name, tried
-        except Exception as exc:
-            tried.append(name)
-            last_exc = exc
-            if not _is_failover_error(exc):
-                raise
-            nxt = next((c for c in chain if c not in tried), None)
-            if not nxt:
-                raise
-            _note_failover(name, nxt, task, exc)
+                stream = _client_instance().chat.completions.create(
+                    model=name,
+                    messages=messages,
+                    tools=tools,
+                    tool_choice="auto",
+                    temperature=0.55,
+                    stream=True,
+                    stream_options={"include_usage": True},
+                    **_extra(),
+                )
+                # Probe the stream so a lazy 429/503 is raised here rather than
+                # halfway through the user's reply. The chunk is re-yielded to the
+                # caller, so nothing is lost.
+                stream_it = iter(stream)
+                try:
+                    peek = next(stream_it)
+                except StopIteration:
+                    peek = None
+                return _ReplayedStream(stream_it, peek), name, tried
+            except Exception as exc:
+                wait = _rate_limit_wait(exc)
+                # Cap the total time spent sleeping so a queue of short
+                # windows cannot add up to an invisible multi-minute hang.
+                if wait and waited_for + wait <= _MAX_RATE_LIMIT_WAIT:
+                    waited_for += wait
+                    logger.info("rate limited on %s; waiting %.1fs (retry %d)",
+                                name, wait, int(waited_for / 5) + 1)
+                    metrics.llm_error("rate_limit_wait")
+                    time.sleep(wait)
+                    continue
+                tried.append(name)
+                last_exc = exc
+                if not _is_failover_error(exc):
+                    raise
+                nxt = next((c for c in chain if c not in tried), None)
+                if not nxt:
+                    raise
+                _note_failover(name, nxt, task, exc)
     if last_exc:
         raise last_exc
     raise RuntimeError("no model available for this request")

@@ -132,25 +132,20 @@ def start_turn(name: str, input: Any, session_id: str | None = None,
     if not enabled():
         return turn
     try:
-        from langfuse import propagate_attributes
-
         lf = client()
-        attrs = {}
-        if session_id:
-            attrs["session_id"] = session_id
-        if user_id:
-            attrs["user_id"] = user_id
-        if tags:
-            attrs["tags"] = tags
-        with propagate_attributes(**attrs):
-            obs = lf.start_observation(
-                as_type="span", name=name, input=input, metadata=metadata
-            )
+        obs = lf.start_observation(
+            as_type="span", name=name, input=input, metadata=metadata
+        )
+        _apply_attributes(obs, session_id, user_id, tags)
         turn._obs = obs
         turn.trace_id = getattr(obs, "trace_id", None)
         turn.parent = {"trace_id": obs.trace_id, "parent_span_id": obs.id}
     except Exception:
-        logger.debug("langfuse start_turn failed", exc_info=True)
+        # Traces are a diagnostic, not a product feature. Log loudly enough to
+        # be noticed, but never let observability break a chat turn.
+        logger.warning("langfuse start_turn failed — tracing is OFF for this "
+                       "turn (check LANGFUSE_PUBLIC_KEY / LANGFUSE_SECRET_KEY)",
+                       exc_info=True)
     return turn
 
 
@@ -171,7 +166,7 @@ def observation(name: str, as_type: str = "span", input: Any = None,
     # --- set-up phase: on failure we yield None and exit, never raise ---
     try:
         lf = client()
-        ctx = _parent_context(parent, session_id, user_id, tags)
+        ctx = _parent_context(parent)
         params: dict[str, Any] = {"as_type": as_type, "name": name}
         if ctx:
             params["trace_context"] = ctx
@@ -193,30 +188,47 @@ def observation(name: str, as_type: str = "span", input: Any = None,
     #     "generator didn't stop after throw()" and masks the real error.
     try:
         with manager as o:
+            _apply_attributes(o, session_id, user_id, tags)
             yield o
     except Exception:
         logger.debug("langfuse observation %s raised", name, exc_info=True)
         raise
 
 
-def _parent_context(parent, session_id, user_id, tags) -> dict | None:
-    """Either an explicit parent link, or attributes alone for a fresh trace."""
+def _parent_context(parent) -> dict | None:
+    """The trace link to hand to `start_observation`, or None for a fresh trace.
+
+    Only a real trace context belongs here. It used to fall back to
+    `langfuse.propagate_attributes(...)`, but in langfuse v5 that is a
+    *decorator factory*, not a context manager — passing it as `trace_context`
+    made the SDK call `.get("trace_id")` on a function and raise
+    AttributeError. That killed the root span and, with it, every trace, while
+    the exception was swallowed at debug level so tracing looked "on" and
+    silently recorded nothing.
+
+    Session/user/tags are applied to the observation itself via
+    `_apply_attributes`.
+    """
     if isinstance(parent, Turn):
         return parent.parent
     if isinstance(parent, dict) and parent.get("trace_id"):
         return parent
-    attrs = {}
-    if session_id:
-        attrs["session_id"] = session_id
-    if user_id:
-        attrs["user_id"] = user_id
-    if tags:
-        attrs["tags"] = tags
-    if attrs:
-        from langfuse import propagate_attributes
-
-        return propagate_attributes(**attrs)
     return None
+
+
+def _apply_attributes(obs_obj, session_id=None, user_id=None, tags=None) -> None:
+    """Tag an observation with session/user identity after it is created."""
+    if obs_obj is None:
+        return
+    for attr, value in (("session_id", session_id),
+                        ("user_id", user_id),
+                        ("tags", tags)):
+        if not value:
+            continue
+        try:
+            setattr(obs_obj, attr, value)
+        except Exception:
+            logger.debug("langfuse attribute %s not applied", attr, exc_info=True)
 
 
 def tool(name: str, input: Any = None, **kw):
