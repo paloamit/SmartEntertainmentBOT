@@ -3,9 +3,12 @@
 # The app lives one level down in EntertainmentBOT/, so every rootDir here
 # is relative to the repo root, not to this file.
 #
-# SECURITY: every secret below uses `sync: false`, which tells Render to
-# PROMPT you for the value in the dashboard. No key is ever written into
-# this file or committed to the repo.
+# SECURITY: no secret is ever written into this file or committed to the repo.
+# Secrets are NOT declared here at all — on a Blueprint-managed service Render
+# reconciles every declared key on each deploy, which wipes any value pasted
+# into the dashboard. Undeclared keys are left alone, so the six required
+# secrets are entered once, by hand, on the service's Environment tab.
+# See the SECRETS block in the API service below for the exact list.
 
 services:
   # ---------------------------------------------------------------- API ----
@@ -41,32 +44,32 @@ services:
       - key: LLM_VISION_MODEL
         value: gemini-3.5-flash
 
-      # ---- SECRETS: you will be prompted for each of these ----
-      - key: LLM_API_KEY
-        sync: false          # Groq
-      - key: LLM_VISION_API_KEY
-        sync: false          # Google Gemini (vision)
-      - key: WATCHMODE_API_KEY
-        sync: false          # catalog + "where to watch"
-      - key: OMDB_API_KEY
-        sync: false          # IMDb ratings
-      - key: LANGFUSE_PUBLIC_KEY
-        sync: false
-      - key: LANGFUSE_SECRET_KEY
-        sync: false
-      # Optional — leave blank. Required only if you want real discovery
-      # filters, "more like this", trailers and cast instead of the
-      # Watchmode/AniList fallbacks.
-      - key: TMDB_API_KEY
-        sync: false
-      # Optional shared cache. Blank uses the in-process cache (24h TTL).
-      - key: REDIS_URL
-        sync: false
-      # Optional persistent DB. Blank uses SQLite, which Render WIPES on
-      # every restart — chats will vanish. Recommended for free tier:
-      # a free Render Postgres instance, or Neon.
-      - key: DATABASE_URL
-        sync: false
+      # ---- SECRETS -------------------------------------------------------
+      # DELIBERATELY NOT LISTED HERE.
+      #
+      # This service is Blueprint-managed, which means Render reconciles the
+      # service's env vars against this file on every sync and deploy. A key
+      # declared here — even with `sync: false` — is considered MANAGED, so
+      # any value pasted into the dashboard is silently wiped on the next
+      # deploy. That produced a service that reported `llm_configured: false`
+      # no matter how many times the secrets were entered.
+      #
+      # Fix: leave them out of the blueprint entirely. Render does not touch
+      # vars it has no knowledge of, so the dashboard values persist.
+      #
+      # Add these ONCE, by hand, on the service's Environment tab:
+      #   LLM_API_KEY            Groq           (required)
+      #   LLM_VISION_API_KEY     Google Gemini  (required for image upload)
+      #   WATCHMODE_API_KEY      Watchmode      (required: catalog + where-to-watch)
+      #   OMDB_API_KEY           OMDb           (required: IMDb ratings)
+      #   LANGFUSE_PUBLIC_KEY    Langfuse       (optional: tracing)
+      #   LANGFUSE_SECRET_KEY    Langfuse       (optional: tracing)
+      #   TMDB_API_KEY           TMDB           (optional: discovery/trailers)
+      #   REDIS_URL              Redis          (optional: shared cache)
+      #   DATABASE_URL            Postgres       (optional: persists sessions)
+      #
+      # Keep real values in `EntertainmentBOT/backend/.env` locally (it is
+      # git-ignored). Never commit them.
 
       # ---- catalog sources ----
       - key: ENABLE_ANILIST_FALLBACK
@@ -107,10 +110,14 @@ services:
     staticPublishPath: dist
     autoDeployTrigger: commit
     envVars:
-      # Baked in at BUILD time, so it must be set before the first build.
-      # Use https://entertainmentbot-api.onrender.com
+      # Baked into the bundle at BUILD time by Vite, so it must be correct in
+      # this file BEFORE the build runs — setting it later in the dashboard has
+      # no effect until the next rebuild.
+      #
+      # NOT secret, so the blueprint manages it. Previously it was `sync: false`,
+      # which made Render treat it as managed-but-empty and wipe the real value.
       - key: VITE_API_BASE_URL
-        sync: false
+        value: https://entertainmentbot-api.onrender.com
       # Tell the SPA router to hand every path to index.html.
       - key: REACT_APP_rewrite
         value: "/* /index.html 200"

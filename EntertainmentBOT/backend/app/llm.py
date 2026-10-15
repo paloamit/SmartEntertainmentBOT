@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import time
 from typing import Any, Optional
@@ -81,14 +82,37 @@ def has_key() -> bool:
     return bool(_settings.llm_api_key.strip())
 
 
-_KEY_MISSING_MSG = (
-    "⚠️ My LLM key isn't configured yet. Add `LLM_API_KEY` to `backend/.env` "
-    "(a free Groq key: https://console.groq.com/keys) and restart the server."
-)
+def _key_missing_msg() -> str:
+    """Deployment-aware 'no key' message.
+
+    Saying "edit backend/.env" is actively wrong on Render: that file is
+    git-ignored and does not exist on the server, so the advice can never be
+    acted on. Detect a hosted deploy and point at the real control panel.
+    """
+    if os.environ.get("RENDER"):
+        return (
+            "⚠️ My LLM key isn't configured on this server. Add `LLM_API_KEY` to the "
+            "**Environment** tab of this service in Render, then redeploy "
+            "(free key: https://console.groq.com/keys)."
+        )
+    return (
+        "⚠️ My LLM key isn't configured yet. Add `LLM_API_KEY` to `backend/.env` "
+        "(a free Groq key: https://console.groq.com/keys) and restart the server."
+    )
+
+
 _NO_SOURCE_MSG = (
-    "⚠️ I don't have an entertainment data source connected yet. Add `TMDB_API_KEY` "
-    "to `backend/.env` (free key: https://www.themoviedb.org/settings/api) so I can "
-    "recommend real movies, series and anime."
+    "⚠️ I don't have an entertainment data source connected yet. "
+    + (
+        "Add `WATCHMODE_API_KEY` (or `TMDB_API_KEY`) to this service's "
+        "**Environment** tab in Render, then redeploy."
+        if os.environ.get("RENDER")
+        else (
+            "Add `TMDB_API_KEY` to `backend/.env` "
+            "(free key: https://www.themoviedb.org/settings/api) so I can "
+            "recommend real movies, series and anime."
+        )
+    )
 )
 
 # ============================================================== system prompt
@@ -1330,7 +1354,7 @@ def run_chat(history: list[dict], session_id: str | None = None,
              parent=None, after_clarify: bool = False) -> dict:
     """Run one assistant turn. `history` ends with the latest user message."""
     if not has_key():
-        return {"kind": "answer", "text": _KEY_MISSING_MSG, "titles": [], "suggestions": []}
+        return {"kind": "answer", "text": _key_missing_msg(), "titles": [], "suggestions": []}
     if not entertainment.any_source_configured():
         return {"kind": "answer", "text": _NO_SOURCE_MSG, "titles": [], "suggestions": []}
 
@@ -1474,8 +1498,8 @@ def stream_chat(history: list[dict], session_id: str | None = None,
       {"type": "final",    kind, text, titles, suggestions, clarify}
     """
     if not has_key():
-        yield {"type": "token", "text": _KEY_MISSING_MSG}
-        yield {"type": "final", "kind": "answer", "text": _KEY_MISSING_MSG,
+        yield {"type": "token", "text": _key_missing_msg()}
+        yield {"type": "final", "kind": "answer", "text": _key_missing_msg(),
                "titles": [], "suggestions": [], "clarify": None}
         return
     if not entertainment.any_source_configured():
