@@ -539,6 +539,12 @@ _BAD_GENERATION_HINTS = ("failed to parse tool call arguments",
 _MAX_RATE_LIMIT_WAIT = 45.0
 
 
+def _is_bad_generation(exc: BaseException) -> bool:
+    """True when the model produced output we could not parse (not a network fault)."""
+    text = str(exc).lower()
+    return any(h in text for h in _BAD_GENERATION_HINTS)
+
+
 def _rate_limit_wait(exc: BaseException) -> float | None:
     """Seconds the provider asked us to wait, if it is short enough to sit out.
 
@@ -1614,6 +1620,10 @@ def stream_chat(history: list[dict], session_id: str | None = None,
           # model, but only while nothing has reached the user — replaying a
           # half-printed reply would be worse than failing.
           last_round_exc: Exception | None = None
+          # Set when every model answered but none of them actually said
+          # anything. Distinguished from a hard failure so the round can be
+          # retried instead of ending the turn.
+          empty_round = False
           for attempt in range(len(chain) + 1):
             started = time.time()
             content_buf = ""
@@ -1716,7 +1726,21 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                        "titles": titles_out, "suggestions": [], "clarify": None,
                        "usage": usage}
                 return
-            raise last_round_exc or RuntimeError("every model in the chain failed")
+            # No exception, but also no output: every model returned an empty
+            # completion. That happens with reasoning models, which sometimes
+            # spend the whole round thinking and emit neither content nor a
+            # tool call. It is a soft failure — the next round may well answer
+            # — so treat it as one instead of killing the turn outright.
+            if last_round_exc is None and round_no + 1 < _MAX_ROUNDS:
+                logger.warning("round %d: no model produced any output; retrying",
+                               round_no + 1)
+                metrics.llm_error("stream_empty_round")
+                empty_round = True
+            else:
+                raise last_round_exc or RuntimeError("every model in the chain failed")
+
+            if empty_round:
+                continue
 
             if not tc_acc:
                 yield {"type": "final", "kind": "answer",
