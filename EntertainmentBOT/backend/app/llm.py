@@ -1802,10 +1802,17 @@ def stream_chat(history: list[dict], session_id: str | None = None,
             # tool call. It is a soft failure — the next round may well answer
             # — so treat it as one instead of killing the turn outright.
             if last_round_exc is None and round_no + 1 < _MAX_ROUNDS:
-                logger.warning("round %d: no model produced any output; retrying",
-                               round_no + 1)
-                metrics.llm_error("stream_empty_round")
-                empty_round = True
+                # Retrying is only worthwhile if something is left to try.
+                # When every model on every provider has already failed, the
+                # extra rounds just replay the same wall six times and stretch
+                # one honest error into minutes of silence.
+                if any(c not in tried for c in chain):
+                    logger.warning("round %d: no model produced any output; retrying",
+                                   round_no + 1)
+                    metrics.llm_error("stream_empty_round")
+                    empty_round = True
+                else:
+                    raise RuntimeError("every model in the chain failed")
             else:
                 raise last_round_exc or RuntimeError("every model in the chain failed")
 
