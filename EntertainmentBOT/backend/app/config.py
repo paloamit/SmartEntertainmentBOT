@@ -9,6 +9,27 @@ from functools import lru_cache
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _tagged(key: str, base: str, models: str, label: str) -> list[str]:
+    """Tag a secondary provider's models, or nothing if it is unconfigured.
+
+    An unconfigured provider contributes no entries, so leaving a provider
+    blank removes it from the chain entirely rather than pointing the bot at a
+    credential it does not have.
+    """
+    if not key or not base:
+        return []
+    tag = (label or "fallback").strip() or "fallback"
+    out: list[str] = []
+    for raw in (models or "").split(","):
+        name = raw.strip()
+        if not name:
+            continue
+        entry = f"{tag}:{name}"
+        if entry not in out:
+            out.append(entry)
+    return out
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
@@ -28,6 +49,13 @@ class Settings(BaseSettings):
     # disables tool calling entirely (no content, no reasoning, no tool
     # calls), which silently breaks every turn. Leave blank.
     llm_reasoning_effort: str = ""
+
+    # Output token cap per call. Sending nothing lets a reasoning model spend
+    # its whole budget thinking and get truncated with `finish_reason: length`
+    # -- which reads as "no output at all" and silently loses the tool call.
+    # Measured: a 7-tool request needed >400 tokens before OpenRouter's free
+    # nemotron emitted find_titles, and succeeded at 2048. Set to 0 to omit.
+    llm_max_tokens: int = 2048
 
     # Failover: comma-separated model ids to try, in order, when the routed
     # model is rate-limited or overloaded. Free tiers meter per model, so a
@@ -51,6 +79,18 @@ class Settings(BaseSettings):
     # Short label used in logs, health output and the "I'm answering via X"
     # hint. Purely cosmetic, but it makes a degraded answer explainable.
     llm_fallback_provider: str = "gemini"
+
+    # ---- third provider: OpenRouter
+    # Worth its own slot because it meters REQUESTS, not tokens. Groq's cap is
+    # 8k tokens/min, and one tool-calling turn sends a long system prompt plus
+    # every tool schema on each of several calls -- so a single question can
+    # exhaust the whole window. OpenRouter charges the same request whether the
+    # turn was heavy or trivial, which is the structural mismatch that makes
+    # Groq unusable on a free tier.
+    llm_openrouter_api_key: str = ""
+    llm_openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    llm_openrouter_models: str = ""
+    llm_openrouter_provider: str = "openrouter"
     # Milliseconds to wait for a rate-limited fallback provider before moving
     # on. Kept short: the fallback exists to keep the user moving, not to make
     # them stare at a spinner.
@@ -180,26 +220,19 @@ class Settings(BaseSettings):
                 or (self.llm_vision_base_url or "").strip())
 
     def fallback_targets(self) -> list[str]:
-        """Secondary-provider models, tagged so they never collide with the
-        primary chain.
+        """Tagged `provider:model` entries for every secondary provider.
 
-        Entries are ``provider:model``. A bare model id always means "primary
-        provider", which keeps existing LLM_FAILOVER_MODELS values working
-        exactly as before.
+        A bare model id always means "primary provider", which keeps existing
+        LLM_FAILOVER_MODELS values working exactly as before.
         """
-        key = self.fallback_api_key()
-        base = self.fallback_base_url()
-        if not key or not base:
-            return []
-        label = (self.llm_fallback_provider or "fallback").strip() or "fallback"
         out: list[str] = []
-        for raw in (self.llm_fallback_models or "").split(","):
-            name = raw.strip()
-            if not name:
-                continue
-            tagged = f"{label}:{name}"
-            if tagged not in out:
-                out.append(tagged)
+        out.extend(_tagged(self.fallback_api_key(), self.fallback_base_url(),
+                           self.llm_fallback_models,
+                           self.llm_fallback_provider))
+        out.extend(_tagged((self.llm_openrouter_api_key or "").strip(),
+                           (self.llm_openrouter_base_url or "").strip(),
+                           self.llm_openrouter_models,
+                           self.llm_openrouter_provider))
         return out
 
 

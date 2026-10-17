@@ -59,6 +59,8 @@ def _client_instance():
 # loops keep treating the chain as a plain list of strings.
 _fallback_client = None
 _fallback_key: tuple | None = None
+_openrouter_client = None
+_openrouter_key: tuple | None = None
 
 
 def _fallback_client_instance():
@@ -78,17 +80,47 @@ def _fallback_client_instance():
     return _fallback_client
 
 
+def _openrouter_client_instance():
+    """OpenRouter counts requests, not tokens -- the reason it is worth a slot.
+
+    It also fails differently: when the upstream provider for a free model is
+    saturated, OpenRouter reports 404 ("unavailable for free") rather than 429,
+    so this is treated as a failoverable condition rather than a real 404.
+    """
+    global _openrouter_client, _openrouter_key
+    key = (
+        (_settings.llm_openrouter_api_key or "").strip(),
+        (_settings.llm_openrouter_base_url or "").strip(),
+    )
+    if _openrouter_client is None or _openrouter_key != key:
+        _openrouter_client = OpenAI(
+            api_key=key[0] or "missing-key",
+            base_url=key[1] or "https://openrouter.ai/api/v1",
+            timeout=90.0,
+            max_retries=2,
+        )
+        _openrouter_key = key
+    return _openrouter_client
+
+
+def _secondary_client(provider: str):
+    """Client for a tagged secondary provider, by its config label."""
+    if provider == (_settings.llm_openrouter_provider or "openrouter").strip():
+        return _openrouter_client_instance()
+    return _fallback_client_instance()
+
+
 def _resolve_target(target: str):
     """(client, model) for a chain entry.
 
     A bare id keeps the legacy meaning — the primary provider, using
     LLM_API_KEY/LLM_BASE_URL — so an existing LLM_FAILOVER_MODELS list needs no
-    changes. `provider:model` selects the configured secondary provider.
+    changes. `provider:model` selects one of the configured secondary providers.
     """
     provider, sep, model = target.partition(":")
     if not sep:
         return _client_instance(), target
-    return _fallback_client_instance(), model
+    return _secondary_client(provider), model
 
 
 def chain_report() -> list[dict]:
@@ -124,13 +156,21 @@ def _extra() -> dict:
     verified the specific provider still calls tools with it set.
     """
     effort = (_settings.llm_reasoning_effort or "").strip()
+    out: dict = {}
+    # Reasoning models think before they act. Without a cap the provider's own
+    # default can be small enough that a wide tool call ends in
+    # `finish_reason: length` — no content, no tool call, nothing to show.
+    budget = _settings.llm_max_tokens
+    if budget and budget > 0:
+        out["max_tokens"] = int(budget)
     if not effort:
-        return {}
+        return out
     logger.warning(
         "LLM_REASONING_EFFORT=%s is being sent; this has been observed to "
         "disable tool calling on Groq's gpt-oss models", effort,
     )
-    return {"extra_body": {"reasoning_effort": effort}}
+    out["extra_body"] = {"reasoning_effort": effort}
+    return out
 
 
 def has_key() -> bool:
@@ -588,6 +628,13 @@ _BAD_GENERATION_HINTS = ("failed to parse tool call arguments",
                          "failed to generate json",
                          "failed to validate json")
 
+# OpenRouter reports a saturated free model as 404 "unavailable for free"
+# rather than 429. Failing over is exactly the right response, so this must not
+# be mistaken for a genuinely missing model.
+_SATURATED_HINTS = ("unavailable for free",
+                    "only available on agentic harnesses",
+                    "provider returned error")
+
 
 # Longest we will sit on a provider's back and wait rather than fail. Above
 # this the user is better served by an immediate, honest error.
@@ -664,6 +711,8 @@ def _is_failover_error(exc: BaseException) -> bool:
         return True
     text = str(exc).lower()
     if any(h in text for h in _FAILOVER_HINTS):
+        return True
+    if any(h in text for h in _SATURATED_HINTS):
         return True
     return any(h in text for h in _BAD_GENERATION_HINTS)
 
@@ -1232,6 +1281,72 @@ def _drop_implied_fields(fields: list[dict], user_text: str) -> list[dict]:
     return keep
 
 
+_TITLE_QUESTION_PREFIXES = (
+    "tell me about", "what is", "what's", "who is", "who's", "explain",
+    "describe", "give me details on", "details on", "info on", "information on",
+    "more about", "summary of", "review of", "tell me who",
+)
+
+_TITLE_STOPWORDS = {
+    "the", "a", "an", "movie", "film", "series", "show", "anime", "about",
+    "please", "me", "is", "what", "who", "tell", "know", "seen", "any", "good",
+}
+
+
+def _recover_title_query(user_text: str) -> str | None:
+    """Pull a named title out of the user's own words.
+
+    Models intermittently call `find_titles` without a `query` even when the
+    user plainly named a film. The catalog then sees a filter-shaped request,
+    runs discovery, and returns trending titles — which is how "tell me about
+    Inception" came back with The Odyssey and Avengers. Recovering the title
+    from the message keeps the lookup honest instead of trusting the model to
+    copy it correctly.
+    """
+    text = (user_text or "").strip()
+    low = text.lower()
+    if not low:
+        return None
+
+    # An explicit quoted string is the strongest signal available.
+    m = re.search(r"[\"'“‘]([^\"'”’]{2,60})[\"'”’]", text)
+    if m:
+        return m.group(1).strip(" .?!,")
+
+    for prefix in _TITLE_QUESTION_PREFIXES:
+        if low.startswith(prefix):
+            candidate = low[len(prefix):].strip(" .?!,")
+            words = [w for w in re.split(r"[\s,]+", candidate) if w]
+            while words and words[-1] in _TITLE_STOPWORDS:
+                words.pop()
+            if words:
+                return " ".join(words)
+    return None
+
+
+def _apply_title_recovery(name: str, args: dict, user_text: str) -> dict:
+    """Force a named title into a filter-only `find_titles` call.
+
+    Fires only when the call carries no `query` AND no filters at all — exactly
+    the shape that silently degrades into trending discovery. A deliberate
+    browse ("recommend a sci-fi movie") carries filters or names no title, so
+    it is left alone.
+    """
+    if name != "find_titles":
+        return args
+    if (args.get("query") or "").strip():
+        return args
+    if any(args.get(k) for k in ("genres", "country", "year_from", "year_to",
+                                  "language", "min_rating", "sort")):
+        return args
+    recovered = _recover_title_query(user_text)
+    if not recovered:
+        return args
+    logger.info("model omitted the title; recovered query=%r from user text",
+                recovered)
+    return {**args, "query": recovered}
+
+
 def _normalise_clarify(args: dict, user_text: str = "") -> dict:
     """Sanitise the ask_user payload so the UI can render it safely."""
     fields: list[dict] = []
@@ -1401,6 +1516,9 @@ def _traced_tool(name: str, args: dict, session_id: str | None,
     model still emits a removed tool call, and the provider then rejects the
     whole request with a validation error.
     """
+    # Single choke point for every tool call, so grounding corrections apply to
+    # the streaming and non-streaming loops alike.
+    args = _apply_title_recovery(name, args, user_text)
     if name == "ask_user" and intercept_ask:
         with obs.tool(name, input=args, session_id=session_id,
                       user_id=visitor_id, parent=parent) as t:
