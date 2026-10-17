@@ -82,12 +82,30 @@ def check_scope(message: str) -> bool:
     # 1. Fast paths — no model call at all.
     if _ENT_KEYWORDS.search(text):
         return True
+
     if _OFFTOPIC_KEYWORDS.search(text):
         return False
 
     # 2. Ambiguous — let the small model decide (cached for 24h).
     data = _classify(_SCOPE_PROMPT % text[:400], f"scope:{cache.normalize_question(text)}")
-    verdict = bool((data or {}).get("entertainment"))
+    if data is None:
+        # The classifier could not be reached. That is an outage, not a
+        # verdict. Reading it as "off topic" made the bot refuse every
+        # keyword-free question — including "tell me about Pulp Fiction" —
+        # for as long as the model provider was rate-limited. Failing open is
+        # the safe direction: grounding already prevents invented titles, so
+        # a slightly off-topic answer beats refusing a valid one.
+        #
+        # Deliberately NOT using the title-recovery heuristic as a fast path
+        # here: its "what is ..." prefix happily matches "what is the weather
+        # in London", which would wave through exactly the questions the
+        # classifier exists to catch. Fail-open keeps precision intact when
+        # the classifier is healthy, and only relaxes during an outage.
+        metrics.scope_unavailable()
+        logger.warning("scope classifier unavailable; treating %r as in scope",
+                       text[:80])
+        return True
+    verdict = bool(data.get("entertainment"))
     if not verdict:
         metrics.scope_rejected()
     return verdict

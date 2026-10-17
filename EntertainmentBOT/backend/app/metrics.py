@@ -48,6 +48,10 @@ if _ENABLED:
     SCOPE_REJECTIONS = Counter(
         "sebot_scope_rejections_total", "Off-topic questions declined"
     )
+    SCOPE_UNAVAILABLE = Counter(
+        "sebot_scope_unavailable_total",
+        "Scope checks skipped because the classifier was unreachable",
+    )
     CLARIFY = Counter("sebot_clarify_total", "Clarifying rounds asked", ["slot"])
 
 
@@ -135,6 +139,17 @@ def app_rating(stars: int) -> None:
 def scope_rejected() -> None:
     if _ENABLED:
         _safe(lambda: SCOPE_REJECTIONS.inc())
+
+
+def scope_unavailable() -> None:
+    """The scope classifier could not be reached, so the check failed open.
+
+    Worth counting separately from a rejection: a rising value here means
+    questions are being answered without a relevance check because the model
+    provider is unhealthy, not because the bot decided to ignore scope.
+    """
+    if _ENABLED:
+        _safe(lambda: SCOPE_UNAVAILABLE.inc())
 
 
 def clarify(slot: str) -> None:
