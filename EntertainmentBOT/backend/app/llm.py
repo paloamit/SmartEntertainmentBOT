@@ -139,6 +139,19 @@ def chain_report() -> list[dict]:
     return out
 
 
+def _max_tokens() -> dict:
+    """Output cap for the two tool-calling chat paths.
+
+    Deliberately NOT folded into `_extra()`: the short helpers (`complete_json`,
+    `complete_text`, vision) pass their own `max_tokens` and would blow up with
+    "got multiple values for keyword argument". That shipped briefly and the
+    symptom was not a crash — the guardrail silently failed, so every named
+    title came back as "that's outside my beat".
+    """
+    budget = _settings.llm_max_tokens
+    return {"max_tokens": int(budget)} if budget and budget > 0 else {}
+
+
 def _extra() -> dict:
     """Extra request body shared by every model call.
 
@@ -156,21 +169,13 @@ def _extra() -> dict:
     verified the specific provider still calls tools with it set.
     """
     effort = (_settings.llm_reasoning_effort or "").strip()
-    out: dict = {}
-    # Reasoning models think before they act. Without a cap the provider's own
-    # default can be small enough that a wide tool call ends in
-    # `finish_reason: length` — no content, no tool call, nothing to show.
-    budget = _settings.llm_max_tokens
-    if budget and budget > 0:
-        out["max_tokens"] = int(budget)
     if not effort:
-        return out
+        return {}
     logger.warning(
         "LLM_REASONING_EFFORT=%s is being sent; this has been observed to "
         "disable tool calling on Groq's gpt-oss models", effort,
     )
-    out["extra_body"] = {"reasoning_effort": effort}
-    return out
+    return {"extra_body": {"reasoning_effort": effort}}
 
 
 def has_key() -> bool:
@@ -748,6 +753,7 @@ def _complete_with_failover(messages: list[dict], tools: list[dict],
                     tools=tools,
                     tool_choice="auto",
                     temperature=0.55,
+                    **_max_tokens(),
                     **_extra(),
                 )
                 return resp, model_id, tried
@@ -799,6 +805,11 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
                     temperature=0.55,
                     stream=True,
                     stream_options={"include_usage": True},
+                    # Reasoning models think before they act. Without a cap the
+                    # provider's default can run out mid-thought and the turn
+                    # comes back finish_reason=length -- no content, no tool
+                    # call, nothing to show. Set LLM_MAX_TOKENS=0 to omit.
+                    **_max_tokens(),
                     **_extra(),
                 )
                 # Probe the stream so a lazy 429/503 is raised here rather than
