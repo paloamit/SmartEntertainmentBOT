@@ -180,6 +180,11 @@ def health():
                    "vision": settings.llm_vision_model},
         "llm_configured": llm.has_key(),
         "tmdb_configured": entertainment.tmdb_configured(),
+        # The failover chain, resolved to real provider endpoints. "Groq
+        # configured" is not the same as "Groq usable" -- once its daily budget
+        # is spent every model on it fails at once, and this is what the
+        # secondary provider is there to absorb.
+        "llm_chain": llm.chain_report(),
         # Which catalog sources actually hold a credential. This used to be
         # invisible, so a missing WATCHMODE_API_KEY looked identical to
         # "the search found nothing" from the outside — the bot just said it

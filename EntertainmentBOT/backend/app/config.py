@@ -36,6 +36,26 @@ class Settings(BaseSettings):
     llm_failover_models: str = "openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b"
     llm_failover_enabled: bool = True
 
+    # ---- second provider, used only when the whole primary chain is walled off
+    # Free tiers meter quota PER ACCOUNT AND PER PROVIDER, so when Groq's daily
+    # budget is spent every Groq model fails in the same breath and no amount of
+    # model-level failover helps. A different vendor with its own quota turns
+    # that dead end into a slower answer. Google Gemini is the natural partner:
+    # the key is usually already provisioned for poster vision, and its
+    # OpenAI-compatible endpoint serves tool calling.
+    #
+    # Left blank, the bot behaves exactly as before.
+    llm_fallback_base_url: str = ""
+    llm_fallback_api_key: str = ""
+    llm_fallback_models: str = ""
+    # Short label used in logs, health output and the "I'm answering via X"
+    # hint. Purely cosmetic, but it makes a degraded answer explainable.
+    llm_fallback_provider: str = "gemini"
+    # Milliseconds to wait for a rate-limited fallback provider before moving
+    # on. Kept short: the fallback exists to keep the user moving, not to make
+    # them stare at a spinner.
+    llm_fallback_timeout_ms: int = 90000
+
     # Vision model for poster/image recognition. Groq's free tier does NOT
     # currently serve an image-capable model, so set LLM_VISION_API_KEY +
     # LLM_VISION_BASE_URL to a vision provider (Gemini's OpenAI-compatible
@@ -142,7 +162,45 @@ class Settings(BaseSettings):
             name = raw.strip()
             if name and name not in chain:
                 chain.append(name)
+        chain.extend(self.fallback_targets())
         return chain
+
+    def fallback_api_key(self) -> str:
+        """Fallback provider key, defaulting to the vision key.
+
+        Both point at the same vendor in the common setup, and the vision key
+        is already configured, so asking the operator to paste the same secret
+        twice is a good way to end up with a half-configured deployment.
+        """
+        return ((self.llm_fallback_api_key or "").strip()
+                or (self.llm_vision_api_key or "").strip())
+
+    def fallback_base_url(self) -> str:
+        return ((self.llm_fallback_base_url or "").strip()
+                or (self.llm_vision_base_url or "").strip())
+
+    def fallback_targets(self) -> list[str]:
+        """Secondary-provider models, tagged so they never collide with the
+        primary chain.
+
+        Entries are ``provider:model``. A bare model id always means "primary
+        provider", which keeps existing LLM_FAILOVER_MODELS values working
+        exactly as before.
+        """
+        key = self.fallback_api_key()
+        base = self.fallback_base_url()
+        if not key or not base:
+            return []
+        label = (self.llm_fallback_provider or "fallback").strip() or "fallback"
+        out: list[str] = []
+        for raw in (self.llm_fallback_models or "").split(","):
+            name = raw.strip()
+            if not name:
+                continue
+            tagged = f"{label}:{name}"
+            if tagged not in out:
+                out.append(tagged)
+        return out
 
 
 @lru_cache

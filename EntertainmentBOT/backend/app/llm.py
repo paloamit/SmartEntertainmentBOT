@@ -52,6 +52,61 @@ def _client_instance():
     return _client
 
 
+# ------------------------------------------------------- provider failover
+# A chain entry is either a bare model id (primary provider) or
+# `provider:model` (secondary provider). `_resolve_target` is the single place
+# that turns either form into a live client plus a model name, so the failover
+# loops keep treating the chain as a plain list of strings.
+_fallback_client = None
+_fallback_key: tuple | None = None
+
+
+def _fallback_client_instance():
+    global _fallback_client, _fallback_key
+    key = (
+        _settings.fallback_api_key(),
+        _settings.fallback_base_url(),
+    )
+    if _fallback_client is None or _fallback_key != key:
+        _fallback_client = OpenAI(
+            api_key=key[0] or "missing-key",
+            base_url=key[1],
+            timeout=_settings.llm_fallback_timeout_ms / 1000.0,
+            max_retries=2,
+        )
+        _fallback_key = key
+    return _fallback_client
+
+
+def _resolve_target(target: str):
+    """(client, model) for a chain entry.
+
+    A bare id keeps the legacy meaning — the primary provider, using
+    LLM_API_KEY/LLM_BASE_URL — so an existing LLM_FAILOVER_MODELS list needs no
+    changes. `provider:model` selects the configured secondary provider.
+    """
+    provider, sep, model = target.partition(":")
+    if not sep:
+        return _client_instance(), target
+    return _fallback_client_instance(), model
+
+
+def chain_report() -> list[dict]:
+    """The failover chain with each entry's real provider, for /api/health."""
+    out: list[dict] = []
+    for target in _failover_chain("large"):
+        provider, sep, model = target.partition(":")
+        if not sep:
+            provider, model = "primary", target
+        try:
+            client, model_id = _resolve_target(target)
+            out.append({"provider": provider, "model": model_id,
+                        "base_url": str(client.base_url)})
+        except Exception:
+            out.append({"provider": provider, "model": model, "error": True})
+    return out
+
+
 def _extra() -> dict:
     """Extra request body shared by every model call.
 
@@ -637,15 +692,16 @@ def _complete_with_failover(messages: list[dict], tools: list[dict],
         waited_for = 0.0
         while True:
             try:
-                resp = _client_instance().chat.completions.create(
-                    model=name,
+                client, model_id = _resolve_target(name)
+                resp = client.chat.completions.create(
+                    model=model_id,
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
                     temperature=0.55,
                     **_extra(),
                 )
-                return resp, name, tried
+                return resp, model_id, tried
             except Exception as exc:
                 wait = _rate_limit_wait(exc)
                 if wait and waited_for + wait <= _MAX_RATE_LIMIT_WAIT:
@@ -663,6 +719,10 @@ def _complete_with_failover(messages: list[dict], tools: list[dict],
                 if not nxt:
                     raise
                 _note_failover(name, nxt, task, exc)
+                # Hand over to the next model. Without this the `while` retries
+                # the same model forever, so a rate-limited provider spins until
+                # the process is killed instead of ever reaching the fallback.
+                break
     if last_exc:
         raise last_exc
     raise RuntimeError("no model available for this request")
@@ -681,8 +741,9 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
         waited_for = 0.0
         while True:
             try:
-                stream = _client_instance().chat.completions.create(
-                    model=name,
+                client, model_id = _resolve_target(name)
+                stream = client.chat.completions.create(
+                    model=model_id,
                     messages=messages,
                     tools=tools,
                     tool_choice="auto",
@@ -699,7 +760,7 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
                     peek = next(stream_it)
                 except StopIteration:
                     peek = None
-                return _ReplayedStream(stream_it, peek), name, tried
+                return _ReplayedStream(stream_it, peek), model_id, tried
             except Exception as exc:
                 wait = _rate_limit_wait(exc)
                 # Cap the total time spent sleeping so a queue of short
@@ -719,6 +780,10 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
                 if not nxt:
                     raise
                 _note_failover(name, nxt, task, exc)
+                # Hand over to the next model. Without this the `while` retries
+                # the same model forever, so a rate-limited provider spins until
+                # the process is killed instead of ever reaching the fallback.
+                break
     if last_exc:
         raise last_exc
     raise RuntimeError("no model available for this request")
@@ -1666,7 +1731,12 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                             if rc:
                                 reasoning_buf += rc
                         for tcd in getattr(delta, "tool_calls", None) or []:
-                            slot = tc_acc.setdefault(tcd.index, {"id": None, "name": "", "args": ""})
+                            # Gemini's OpenAI-compatible endpoint sends `index: null` on every tool-call
+                            # delta. Using that as the dict key would merge two
+                            # parallel calls into one slot and corrupt both, so a
+                            # missing index falls back to "the next free slot".
+                            key = tcd.index if tcd.index is not None else len(tc_acc)
+                            slot = tc_acc.setdefault(key, {"id": None, "name": "", "args": ""})
                             if tcd.id:
                                 slot["id"] = tcd.id
                             if tcd.function:

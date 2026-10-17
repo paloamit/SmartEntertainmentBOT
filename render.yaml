@@ -38,6 +38,18 @@ services:
       - key: LLM_FAILOVER_MODELS
         value: openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b
 
+      # ---- second provider: takes over when the whole Groq chain is walled off
+      # Groq meters quota per account, so once its daily budget is spent every
+      # Groq model fails together and model-level failover cannot help. Gemini
+      # has its own quota, so this turns a dead end into a slower answer.
+      # Reuses the vision key — same vendor, same OpenAI-compatible endpoint.
+      - key: LLM_FALLBACK_BASE_URL
+        value: https://generativelanguage.googleapis.com/v1beta/openai
+      - key: LLM_FALLBACK_MODELS
+        value: gemini-3.5-flash
+      - key: LLM_FALLBACK_PROVIDER
+        value: gemini
+
       # ---- vision (Gemini via OpenAI-compatible endpoint) ----
       - key: LLM_VISION_BASE_URL
         value: https://generativelanguage.googleapis.com/v1beta/openai
@@ -60,6 +72,9 @@ services:
       # Add these ONCE, by hand, on the service's Environment tab:
       #   LLM_API_KEY            Groq           (required)
       #   LLM_VISION_API_KEY     Google Gemini  (required for image upload)
+      #                           Doubles as the failover provider's key, so
+      #                           Groq's daily cap being spent degrades to
+      #                           Gemini instead of failing outright.
       #   WATCHMODE_API_KEY      Watchmode      (required: catalog + where-to-watch)
       #   OMDB_API_KEY           OMDb           (required: IMDb ratings)
       #   LANGFUSE_PUBLIC_KEY    Langfuse       (optional: tracing)
