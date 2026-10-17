@@ -37,6 +37,11 @@ services:
         value: "true"
       - key: LLM_FAILOVER_MODELS
         value: openai/gpt-oss-120b,qwen/qwen3.8-27b,openai/gpt-oss-20b
+      # Output token cap per call. Sending nothing let reasoning models spend
+      # the whole provider default thinking, then get truncated with
+      # finish_reason=length -- no content and no tool call.
+      - key: LLM_MAX_TOKENS
+        value: "2048"
 
       # ---- second provider: takes over when the whole Groq chain is walled off
       # Groq meters quota per account, so once its daily budget is spent every
