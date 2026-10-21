@@ -784,7 +784,8 @@ def _complete_with_failover(messages: list[dict], tools: list[dict],
 
 
 def _stream_with_failover(messages: list[dict], tools: list[dict],
-                          chain: list[str], tried: list[str], task: str):
+                          chain: list[str], tried: list[str], task: str,
+                          tool_choice="auto"):
     """Streaming completion. `create` is lazy, so the 429 often only surfaces
     on the first chunk read — we pull one to find out before handing it on."""
     last_exc: BaseException | None = None
@@ -801,7 +802,7 @@ def _stream_with_failover(messages: list[dict], tools: list[dict],
                     model=model_id,
                     messages=messages,
                     tools=tools,
-                    tool_choice="auto",
+                    tool_choice=tool_choice,
                     temperature=0.55,
                     stream=True,
                     stream_options={"include_usage": True},
@@ -1818,12 +1819,39 @@ def stream_chat(history: list[dict], session_id: str | None = None,
     try:
         content_buf = ""
         suppress_ask = False
+        # Turn-scoped, unlike the per-attempt `emitted` below. Rounds are
+        # allowed to retry while nothing has reached the user, but once real
+        # text is on screen a fresh round would make the bot say the same
+        # sentence twice -- which is exactly what happened: "Let me find some
+        # mind-bending thrillers for you." streamed at +139s, the round failed,
+        # and the identical sentence streamed again at +304s.
+        shown_to_user = False
+        # Set to a specific tool when a round announced it would search but
+        # called nothing. That round is a deliberate continuation, not a
+        # replay, so it is allowed past the guard below.
+        force_choice = None
         for round_no in range(_MAX_ROUNDS):
           # Nothing streams until the model emits its first delta, and a
           # rate-limited round can sit silent for minutes while the failover
           # chain works through providers. Without this the browser shows an
           # empty composer the whole time, which reads as "broken" rather than
           # "waiting". Re-sent every round so it stays honest if we fail over.
+          if shown_to_user and not force_choice:
+              # Text is already visible. Finish on what we have instead of
+              # paying for another model round that can only repeat it.
+              yield {"type": "final", "kind": "answer",
+                     "text": _finalise_text(content_buf, titles_out),
+                     "titles": titles_out, "suggestions": [], "clarify": None,
+                     "usage": usage}
+              return
+          if force_choice:
+              # The model promised a search and did not make one. Tell it to
+              # call the tool instead of narrating, then clear the request so
+              # a subsequent round is not forced too.
+              tool_choice_this_round = force_choice
+              force_choice = None
+          else:
+              tool_choice_this_round = "auto"
           yield {"type": "status",
                  "text": "Thinking…" if round_no == 0 else "Trying another model…"}
           # A round can still fail AFTER the first chunk ("Failed to parse tool
@@ -1836,6 +1864,11 @@ def stream_chat(history: list[dict], session_id: str | None = None,
           # retried instead of ending the turn.
           empty_round = False
           for attempt in range(len(chain) + 1):
+            # Once text has reached the user, this round is finished. A retry
+            # would either replay the same sentence or, because content_buf is
+            # reset below, discard it entirely -- both worse than stopping.
+            if shown_to_user:
+                break
             started = time.time()
             content_buf = ""
             reasoning_buf = ""
@@ -1855,6 +1888,7 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                 ) as gen:
                     stream, model, tried = _stream_with_failover(
                         messages, _tools_for(suppress_ask), chain, tried, task,
+                        tool_choice=tool_choice_this_round,
                     )
 
                     for chunk in stream:
@@ -1868,6 +1902,7 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                             if safe:
                                 content_buf += safe
                                 emitted = True
+                                shown_to_user = True
                                 yield {"type": "token", "text": safe}
                         else:
                             # Reasoning tokens are NOT shown to the user — they are only
@@ -1904,6 +1939,15 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                     if tail:
                         content_buf += tail
 
+                    # A tool-call delta can announce a slot (an `index`) and
+                    # then never deliver a name -- Groq does this when it kills
+                    # a stream over a malformed call. Those husks must not
+                    # count as a real tool call: they blocked the empty-round
+                    # retry below, so the turn ended with the model's opening
+                    # line and zero cards.
+                    tc_acc = {k: v for k, v in tc_acc.items()
+                              if (v.get("name") or "").strip()}
+
                     obs.record_generation(
                         gen,
                         output=content_buf or f"(tool calls: {[s['name'] for s in tc_acc.values()]})",
@@ -1912,9 +1956,22 @@ def stream_chat(history: list[dict], session_id: str | None = None,
             except Exception as exc:
                 # Mid-stream failure. Safe to retry only while the user hasn't
                 # seen anything from this round, or they'd get it twice.
+                #
+                # A preamble does not count as "seen". Free models routinely
+                # stream "Let me find you some thrillers" and then emit a
+                # malformed tool call, which makes the provider kill the
+                # stream. Treating that announcement as a finished reply meant
+                # the turn ended on a promise with zero cards; retrying is what
+                # actually gets the user a recommendation.
+                preamble_only = emitted and looks_like_preamble(content_buf)
                 last_round_exc = exc
-                if emitted or not _is_failover_error(exc):
+                if (emitted and not preamble_only) or not _is_failover_error(exc):
                     raise
+                if preamble_only:
+                    logger.info("round %s died after only a preamble; retrying",
+                                round_no + 1)
+                    metrics.llm_error("stream_preamble_retry")
+                    shown_to_user = False
                 nxt = next((c for c in chain if c not in tried), None)
                 if not nxt:
                     raise
@@ -1941,9 +1998,47 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                     break
                 content_buf = strip_tool_markup(reasoning_buf)
                 emitted = True
+                shown_to_user = True
                 yield {"type": "token", "text": content_buf}
 
                 break   # round completed — leaves the attempt loop only
+
+            # The model announced it would look ("Let me find you some
+            # mind-bending thrillers") and then simply stopped, with no tool
+            # call at all. Left alone the turn ends as an empty preamble with
+            # zero cards -- the user sees one sentence and nothing else.
+            # Re-running the round gives the model another chance to actually
+            # call find_titles. Checked BEFORE the plain break below, which
+            # would otherwise finish the turn on the announcement.
+            #
+            # Deliberately a plain retry rather than forcing tool_choice:
+            # forcing it makes Groq reject the request outright with
+            # "Failed to call a function", which loses even the fallback.
+            if emitted and not tc_acc and not titles_out and looks_like_preamble(content_buf):
+                logger.info("round %s promised a search but called no tool; retrying",
+                            round_no + 1)
+                metrics.llm_error("stream_preamble_only")
+                # The text shown so far is only an announcement, and it is
+                # about to be followed by the answer it promised -- not
+                # repeated. Clear the flag so the guard above lets the retry
+                # through, and keep the announcement on screen.
+                shown_to_user = False
+                continue
+
+            # A clean stream with prose and no tool call is a finished round --
+            # that prose IS the answer. Finish here.
+            #
+            # This must yield `final` and return, not `break`. `break` skips the
+            # for/else below (which is the only place `if not tc_acc` yields the
+            # answer), so the round fell through into the tool loop with nothing
+            # to run, then looped on and reset content_buf. The user had already
+            # seen the sentence stream past, and the turn ended with zero cards.
+            if emitted and not tc_acc:
+                yield {"type": "final", "kind": "answer",
+                       "text": _finalise_text(content_buf, titles_out),
+                       "titles": titles_out, "suggestions": [], "clarify": None,
+                       "usage": usage}
+                return
           else:
             # Every model in the chain produced unusable arguments.
             if emitted:
@@ -2162,6 +2257,34 @@ def looks_like_deliberation(text: str) -> bool:
         return False
     hits = len(_DELIBERATION.findall(text))
     return hits >= 2 or (hits >= 1 and text.count("\n") >= 2)
+
+
+_PREAMBLE = re.compile(
+    r"(?i)\b("
+    r"let me (?:find|look|search|check|see|pull|get|grab|bring)"
+    r"|i'?ll (?:find|look|search|check|see|pull|get|grab|bring)"
+    r"|allow me to (?:find|look|search|check)"
+    r")\b"
+)
+
+
+def looks_like_preamble(text: str) -> bool:
+    """True when text merely announces an upcoming search.
+
+    Free models routinely reply "Let me find you some mind-bending thrillers."
+    and then stop, having called no tool. The turn then ends as a promise with
+    zero cards -- the user sees a sentence and nothing else. Those openings are
+    announcements, not answers, and a real answer always carries either a tool
+    call or a title from the catalog.
+
+    Matched anywhere in the text, not just at the start: the announcement often
+    follows a pleasantry ("Great pick -- mind-benders are my favourite kind!
+    Let me find some strong options for you.").
+    """
+    text = (text or "").strip()
+    if not text or len(text) > 400:
+        return False
+    return bool(_PREAMBLE.search(text))
 
 
 def strip_tool_markup(text: str) -> str:
