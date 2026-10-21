@@ -502,6 +502,10 @@ def chat_stream(req: ChatRequest, visitor_id: str = Depends(current_visitor)):
                     "is_new": session_row is None,
                     "user_name": user_name,
                     "query_count": db.get_session(sid, visitor_id)["session"]["query_count"]})
+        # The scope check and the first model round both run before anything
+        # streams, and on a rate-limited provider that is easily a minute of
+        # silence. Say so up front rather than leaving a blank composer.
+        yield _sse({"type": "status", "text": "Checking your request…"})
         final: dict = {"kind": "answer", "text": "", "titles": [], "suggestions": [],
                        "clarify": None}
         # The SSE generator yields between steps and resumes in a fresh OTel

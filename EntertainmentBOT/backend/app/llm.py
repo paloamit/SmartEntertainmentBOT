@@ -1677,7 +1677,17 @@ def run_chat(history: list[dict], session_id: str | None = None,
                 tool_calls = msg.tool_calls or []
                 content = strip_tool_markup((msg.content or "").strip())
                 if not content:
-                    content = strip_tool_markup(getattr(msg, "reasoning", None) or "").strip()
+                    # Reasoning models sometimes answer inside `reasoning`.
+                    # Only trust it when it reads as an answer; when it is the
+                    # model's plan ("we must call recommend_titles... let's do
+                    # that") showing it verbatim puts the model's notes on
+                    # screen instead of a reply.
+                    raw_reasoning = (getattr(msg, "reasoning", None) or "").strip()
+                    if raw_reasoning and looks_like_deliberation(raw_reasoning):
+                        logger.info("model answered only in `reasoning` and it reads "
+                                    "as chain-of-thought; discarding it")
+                    else:
+                        content = strip_tool_markup(raw_reasoning)
 
                 obs.record_generation(
                     gen,
@@ -1809,6 +1819,13 @@ def stream_chat(history: list[dict], session_id: str | None = None,
         content_buf = ""
         suppress_ask = False
         for round_no in range(_MAX_ROUNDS):
+          # Nothing streams until the model emits its first delta, and a
+          # rate-limited round can sit silent for minutes while the failover
+          # chain works through providers. Without this the browser shows an
+          # empty composer the whole time, which reads as "broken" rather than
+          # "waiting". Re-sent every round so it stays honest if we fail over.
+          yield {"type": "status",
+                 "text": "Thinking…" if round_no == 0 else "Trying another model…"}
           # A round can still fail AFTER the first chunk ("Failed to parse tool
           # call arguments as JSON" arrives mid-stream). Retry it on the next
           # model, but only while nothing has reached the user — replaying a
@@ -1909,7 +1926,19 @@ def stream_chat(history: list[dict], session_id: str | None = None,
 
             # A reasoning model that never produced `content` still has an
             # answer sitting in `reasoning` — surface it instead of nothing.
+            # But only when that reasoning actually reads as an answer. When it
+            # is the model's private plan ("we must call recommend_titles ...
+            # let's do that"), showing it verbatim is worse than saying
+            # nothing, so it is dropped here and the prose writer handles it.
             if not content_buf.strip() and not tc_acc and reasoning_buf.strip():
+                if looks_like_deliberation(reasoning_buf):
+                    logger.info(
+                        "round %s: model answered only inside `reasoning` and it "
+                        "reads as chain-of-thought; discarding it rather than "
+                        "showing the user the model's notes", round_no + 1,
+                    )
+                    reasoning_buf = ""
+                    break
                 content_buf = strip_tool_markup(reasoning_buf)
                 emitted = True
                 yield {"type": "token", "text": content_buf}
@@ -2010,11 +2039,25 @@ def stream_chat(history: list[dict], session_id: str | None = None,
                 return
 
             if recommended:
-                text = _finalise_text(strip_tool_markup(content_buf or reasoning_buf), titles_out)
-                if not (content_buf or reasoning_buf).strip():
+                # Prefer what the model actually wrote to the user. `reasoning`
+                # is only a last resort, and only when it reads as an answer
+                # rather than the model's notes to itself.
+                spoken = strip_tool_markup(content_buf).strip()
+                if not spoken and reasoning_buf.strip():
+                    if looks_like_deliberation(reasoning_buf):
+                        logger.info(
+                            "recommended titles but the model only produced "
+                            "chain-of-thought; writing the reply instead"
+                        )
+                        reasoning_buf = ""
+                    else:
+                        spoken = strip_tool_markup(reasoning_buf).strip()
+                text = _finalise_text(spoken, titles_out)
+                if not spoken:
                     # Model only made the tool call — write the prose cheaply.
-                    text = _write_prose(messages, titles_out, session_id)
-                    if text:
+                    prose = _write_prose(messages, titles_out, session_id)
+                    if prose:
+                        text = _finalise_text(prose, titles_out)
                         yield {"type": "token", "text": text}
                 yield {"type": "final", "kind": "answer", "text": text,
                        "titles": titles_out, "suggestions": [], "clarify": None,
@@ -2088,6 +2131,37 @@ def _drop_fenced_payloads(text: str) -> str:
     # An unmatched trailing fence (nothing after it to close the block).
     cleaned = re.sub(r"```[a-zA-Z0-9_+#-]*[ \t]*$", "", cleaned.rstrip())
     return cleaned
+
+
+_DELIBERATION = re.compile(
+    r"(?i)\b("
+    r"the user asked:|let'?s (?:do that|see|think)|we (?:should|must|could|need|have to|might)"
+    r"|i (?:should|need|must|could|will|can) (?:call|use|try|check|provide)"
+    r"|do we have|is there a|the guidelines[:.]|however,? we|also we"
+    r"|first,? then|step \d|thinking:|plan:"
+    r")\b"
+)
+
+
+def looks_like_deliberation(text: str) -> bool:
+    """True when text reads as a model's private chain-of-thought.
+
+    Reasoning models routinely narrate their plan in `reasoning` ("The user
+    asked: ... We must call recommend_titles ... Let's do that."). That is
+    thinking, not an answer, and showing it verbatim is the single most
+    jarring failure this bot can have -- the user watches it reason at them
+    instead of getting a reply. The markers below are first-person planning
+    and self-instruction, which a real answer does not contain.
+
+    Deliberately loose rather than precise: this only decides whether to fall
+    back to writing prose cheaply, so a false positive costs one small model
+    call while a false negative puts the model's notes on screen.
+    """
+    text = (text or "").strip()
+    if len(text) < 60:
+        return False
+    hits = len(_DELIBERATION.findall(text))
+    return hits >= 2 or (hits >= 1 and text.count("\n") >= 2)
 
 
 def strip_tool_markup(text: str) -> str:
